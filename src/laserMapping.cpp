@@ -62,6 +62,7 @@
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
+#include <smfom_compensate.hpp>
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -110,8 +111,14 @@ deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
-PointCloudXYZI::Ptr feats_down_body(new PointCloudXYZI());
+PointCloudXYZI::Ptr feats_down_body(new PointCloudXYZI());          // body frame, unwarped
 PointCloudXYZI::Ptr feats_down_world(new PointCloudXYZI());
+
+// Per-particle motion-compensated body-frame clouds. Built once per
+// scan after downsampling; consumed by h_share_model via
+// ekfom_data.particle_idx (compensation strategy B in INTEGRATION.md
+// §4). Index is parallel to kf.particles_, size == kf.num_particles_.
+std::vector<PointCloudXYZI::Ptr> feats_down_body_per_particle;
 PointCloudXYZI::Ptr normvec(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr laserCloudOri(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI(100000, 1));
@@ -441,10 +448,15 @@ void map_incremental()
     PointVector PointNoNeedDownsample;
     PointToAdd.reserve(feats_down_size);
     PointNoNeedDownsample.reserve(feats_down_size);
+    // Map updates use particle 0's warped cloud + particle 0's
+    // body→world transform (state_point reads kf.get_x(0) earlier).
+    // Per-particle map maintenance is out of scope for this
+    // integration commit; see INTEGRATION.md §5.1.
+    PointCloudXYZI& feats_down_body_p = *feats_down_body_per_particle[0];
     for (int i = 0; i < feats_down_size; i++)
     {
         /* transform to world frame */
-        pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+        pointBodyToWorld(&(feats_down_body_p.points[i]), &(feats_down_world->points[i]));
         /* decide if need add to map */
         if (!Nearest_Points[i].empty() && flg_EKF_inited)
         {
@@ -490,7 +502,10 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
 {
     if(scan_pub_en)
     {
-        PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
+        // Particle 0's warped cloud as the published "the cloud" — a
+        // visualization handle, not the posterior. See INTEGRATION.md §5.1.
+        PointCloudXYZI::Ptr laserCloudFullRes(
+            dense_pub_en ? feats_undistort : feats_down_body_per_particle[0]);
         int size = laserCloudFullRes->points.size();
         PointCloudXYZI::Ptr laserCloudWorld( \
                         new PointCloudXYZI(size, 1));
@@ -632,7 +647,8 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
     pubOdomAftMapped->publish(odomAftMapped);
-    auto P = kf.get_P();
+    // Visualization handle only — see INTEGRATION.md §5.1.
+    auto P = kf.get_P(0);
     for (int i = 0; i < 6; i ++)
     {
         int k = i < 3 ? i + 3 : i - 3;
@@ -677,9 +693,16 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
 {
     double match_start = omp_get_wtime();
-    laserCloudOri->clear(); 
-    corr_normvect->clear(); 
-    total_residual = 0.0; 
+    laserCloudOri->clear();
+    corr_normvect->clear();
+    total_residual = 0.0;
+
+    // Per-particle motion-compensated cloud (compensation strategy B).
+    // ekfom_data.particle_idx is set by the SMFoM filter before each
+    // h_share invocation. The cache was built once per scan in the main
+    // loop after downsampling; we just look it up here.
+    PointCloudXYZI& feats_down_body_p =
+        *feats_down_body_per_particle[ekfom_data.particle_idx];
 
     /** closest surface search and residual computation **/
     #ifdef MP_EN
@@ -688,8 +711,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     #endif
     for (int i = 0; i < feats_down_size; i++)
     {
-        PointType &point_body  = feats_down_body->points[i]; 
-        PointType &point_world = feats_down_world->points[i]; 
+        PointType &point_body  = feats_down_body_p.points[i];
+        PointType &point_world = feats_down_world->points[i];
 
         /* transform to world frame */
         V3D p_body(point_body.x, point_body.y, point_body.z);
@@ -737,7 +760,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     {
         if (point_selected_surf[i])
         {
-            laserCloudOri->points[effct_feat_num] = feats_down_body->points[i];
+            laserCloudOri->points[effct_feat_num] = feats_down_body_p.points[i];
             corr_normvect->points[effct_feat_num] = normvec->points[i];
             total_residual += res_last[i];
             effct_feat_num ++;
@@ -977,7 +1000,10 @@ private:
             t0 = omp_get_wtime();
 
             p_imu->Process(Measures, kf, feats_undistort);
-            state_point = kf.get_x();
+            // Visualization handle only — not the posterior. Particle 0
+            // chosen for stable single-state ROS output. See
+            // INTEGRATION.md §5.1.
+            state_point = kf.get_x(0);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
             if (feats_undistort->empty() || (feats_undistort == NULL))
@@ -996,6 +1022,16 @@ private:
             downSizeFilterSurf.filter(*feats_down_body);
             t1 = omp_get_wtime();
             feats_down_size = feats_down_body->points.size();
+
+            /*** per-particle motion-compensated clouds (compensation B) ***/
+            // One warp per particle, against that particle's pose history
+            // recorded inside UndistortPcl. Cached for h_share_model.
+            feats_down_body_per_particle.resize(kf.num_particles_);
+            for (unsigned p = 0; p < kf.num_particles_; ++p) {
+                feats_down_body_per_particle[p] =
+                    boost::make_shared<PointCloudXYZI>(
+                        sesmfom::compensate_for(kf, p, *feats_down_body));
+            }
             /*** initialize the map kdtree ***/
             if(ikdtree.Root_Node == nullptr)
             {
@@ -1050,7 +1086,8 @@ private:
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
-            state_point = kf.get_x();
+            // Visualization handle only — see INTEGRATION.md §5.1.
+            state_point = kf.get_x(0);
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
             geoQuat.x = state_point.rot.coeffs()[0];
