@@ -1029,7 +1029,7 @@ private:
             feats_down_body_per_particle.resize(kf.num_particles_);
             for (unsigned p = 0; p < kf.num_particles_; ++p) {
                 feats_down_body_per_particle[p] =
-                    boost::make_shared<PointCloudXYZI>(
+                    std::make_shared<PointCloudXYZI>(
                         sesmfom::compensate_for(kf, p, *feats_down_body));
             }
             /*** initialize the map kdtree ***/

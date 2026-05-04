@@ -297,7 +297,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     kf_state.predict(dt, Q, in);
 
     /* save the poses at each IMU measurement, per particle */
-    double offs_t = tail->header.stamp.toSec() - pcl_beg_time;
+    double offs_t = rclcpp::Time(tail->header.stamp).seconds() - pcl_beg_time;
     for (unsigned p = 0; p < kf_state.num_particles_; ++p) {
         const auto& x_p = kf_state.get_x(p);
         V3D angvel_p = angvel_avr - x_p.bg;
