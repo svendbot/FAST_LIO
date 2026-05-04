@@ -1,7 +1,11 @@
 #ifndef USE_IKFOM_H
 #define USE_IKFOM_H
 
-#include <IKFoM_toolkit/esekfom/esekfom.hpp>
+// Was <IKFoM_toolkit/esekfom/esekfom.hpp>. SMFoM's facade pulls in
+// sesmfom::sesmf as esekfom::esekf and provides a compatible MTK type
+// set (vect, SO3, S2). State definitions below are unchanged.
+#include <use-smfom.hpp>
+#include <SMFoM/mtk/types/S2.hpp>
 
 typedef MTK::vect<3, double> vect3;
 typedef MTK::SO3<double> SO3;
